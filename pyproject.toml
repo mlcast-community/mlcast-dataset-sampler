@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlcast-dataset-sampler"
+dynamic = ["version"]
+description = "Utility to sample mlcast source dataset to generate training ready data"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0 OR BSD-3-Clause" }
+authors = [
+    { name = "Gabriele Franch", email = "franch@fbk.eu" },
+]
+maintainers = [
+    { name = "MLCast Community", email = "franch@fbk.eu" },
+]
+keywords = ["machine-learning", "meteorology", "nowcasting", "dataset", "sampling"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+dependencies = [
+    "dask>=2025.9.1",
+    "fsspec>=2025.9.0",
+    "loguru>=0.7.3",
+    "xarray>=2025.10.0",
+    "zarr>=3.1.3",
+]
+
+[project.scripts]
+"mlcast.sample_dataset" = "mlcast_dataset_sampler.cli:main"
+
+[dependency-groups]
+dev = [
+    "ipdb>=0.13.13",
+    "pre-commit>=4.3.0",
+    "pytest>=9.0.2",
+]
+
+[tool.isort]
+profile = "black"
+
+[tool.setuptools_scm]
+version_scheme = "release-branch-semver"
+local_scheme = "node-and-date"
