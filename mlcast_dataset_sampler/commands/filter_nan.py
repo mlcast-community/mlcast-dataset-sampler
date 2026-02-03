@@ -94,6 +94,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Maximum NaN count per datacube (default: 10000).",
     )
     parser.add_argument(
+        "--time-step-minutes",
+        type=int,
+        default=5,
+        help="Expected time step between consecutive frames in minutes (default: 5).",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -311,7 +317,7 @@ def run(args: argparse.Namespace) -> int:
 
     # Check time continuity
     logger.info("Checking time continuity...")
-    expected_step = pd.Timedelta("00:05:00")
+    expected_step = pd.Timedelta(minutes=args.time_step_minutes)
     time_diffs = time_array[1:] - time_array[:-1]
     gaps = (time_diffs != expected_step).astype(int)
 
