@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+import xarray as xr
 import zarr
 from loguru import logger
 from tqdm import tqdm
@@ -283,7 +284,10 @@ def run(args: argparse.Namespace) -> int:
     try:
         zg = zarr.open(args.zarr_path, mode="r")
         data = zg[args.data_var]
-        time_array_full = pd.to_datetime(zg[args.time_var][:])
+        # Use xarray to properly decode CF-convention time coordinates
+        # (e.g. "minutes since 2001-01-01") instead of raw zarr integers
+        ds = xr.open_zarr(args.zarr_path)
+        time_array_full = pd.DatetimeIndex(ds[args.time_var].values)
 
         logger.info(f"Full dataset shape: T={data.shape[0]}, X={data.shape[1]}, Y={data.shape[2]}")
         logger.info(f"Time range: {time_array_full[0]} to {time_array_full[-1]}")
