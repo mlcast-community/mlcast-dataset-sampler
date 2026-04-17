@@ -9,7 +9,7 @@ from typing import Sequence
 from loguru import logger
 
 from . import __version__
-from .commands import filter_nan, sample
+from .commands import filter_nan, sample, stats_light
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     filter_nan.add_arguments(filter_nan_parser)
     filter_nan_parser.set_defaults(func=filter_nan.run)
+
+    # stats-light subcommand
+    stats_light_parser = subparsers.add_parser(
+        "stats-light",
+        help="Compute cheap per-datacube stats (nan_count, sum, mean, frac_wet) via cumsum windows.",
+        description="Pass 1 of the 3-step sampling pipeline: cumsum-based per-window stats, written to parquet.",
+    )
+    stats_light.add_arguments(stats_light_parser)
+    stats_light_parser.set_defaults(func=stats_light.run)
 
     # sample subcommand
     sample_parser = subparsers.add_parser(
