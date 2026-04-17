@@ -10,11 +10,10 @@ import argparse
 import json
 import os
 import time
-from functools import partial
 from multiprocessing import Pool
 from queue import Queue
 from threading import Thread
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -92,6 +91,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Overwrite output file if it exists.",
     )
+    parser.add_argument(
+        "--time-chunk-size",
+        type=int,
+        default=None,
+        help="Number of timesteps per processing chunk (default: 3 * time_depth).",
+    )
 
 
 def _parse_csv_filename(csv_path: str) -> dict:
@@ -124,65 +129,56 @@ def _parse_csv_filename(csv_path: str) -> dict:
     }
 
 
-def _acceptance_probability(data: NDArray, q_min: float, mean_weight: float) -> float:
-    """Calculate acceptance probability based on data mean."""
-    return min(1.0, q_min + mean_weight * np.nanmean(data))
+def _process_time_chunk(args: tuple) -> list[tuple[int, int, int]]:
+    """Process a single time chunk: load zarr slice, evaluate all coords.
 
-
-def _process_datacube(
-    coord: tuple[int, int, int],
-    data: zarr.Array,
-    n_samples: int,
-    seed: int | None,
-    scale: float,
-    q_min: float,
-    mean_weight: float,
-    Dt: int,
-    w: int,
-    h: int,
-) -> list[tuple[int, int, int]]:
-    """Process a single datacube for importance sampling.
+    Each worker opens its own zarr handle, reads one time chunk, and
+    processes all coordinates that fall within that chunk.
 
     Args:
-        coord: Tuple of (it, ix, iy) coordinates.
-        data: Zarr rain rate array.
-        n_samples: Number of sampling trials.
-        seed: Random seed (None for non-deterministic).
-        scale: Scale factor for exponential transform.
-        q_min: Minimum acceptance probability.
-        mean_weight: Weight for mean contribution to probability.
-        Dt: Time depth.
-        w: Width.
-        h: Height.
+        args: Tuple of (zarr_path, data_var, chunk_t_start, data_t_end,
+              coords, Dt, w, h, n_samples, seed, scale, q_min, mean_weight).
 
     Returns:
-        List of accepted (it, ix, iy) tuples.
+        List of accepted (t, x, y) tuples.
     """
-    try:
-        it, ix, iy = coord
-        time_slice = slice(it, it + Dt)
-        x_slice = slice(ix, ix + w)
-        y_slice = slice(iy, iy + h)
+    (
+        zarr_path, data_var, chunk_t_start, data_t_end,
+        coords, Dt, w, h, n_samples, seed, scale, q_min, mean_weight,
+    ) = args
 
-        # Load data from Zarr
-        chunk = data[time_slice, x_slice, y_slice]
-        # Transform: rescale rain rate
-        transformed = 1 - np.exp(-chunk / scale)
+    # Each worker opens its own zarr handle (no pickle of large arrays)
+    zg = zarr.open(zarr_path, mode="r")
+    data = zg[data_var]
 
-        # Calculate acceptance probability
-        q = _acceptance_probability(transformed, q_min, mean_weight)
+    # Single zarr read for the entire time chunk + overlap, done in-place
+    # on float32 to avoid doubling peak memory when we apply the transform.
+    chunk_data = np.asarray(data[chunk_t_start:data_t_end, :, :], dtype=np.float32)
+    np.divide(chunk_data, -scale, out=chunk_data)
+    np.exp(chunk_data, out=chunk_data)
+    np.subtract(1.0, chunk_data, out=chunk_data)
+    transformed_chunk = chunk_data  # alias for readability
 
-        # Generate random numbers
-        rng = np.random.default_rng(seed)
-        random_numbers = rng.random(n_samples)
-        accepted_count = int(np.sum(random_numbers <= q))
+    # One RNG per chunk (not per-coord). Offsetting by chunk_t_start keeps
+    # runs reproducible while still producing independent streams per chunk,
+    # so different coords actually get different draws.
+    rng = np.random.default_rng(
+        None if seed is None else seed + chunk_t_start
+    )
+    accepted = []
 
-        # Return accepted hits
-        return [(it, ix, iy)] * accepted_count
+    for row in coords:
+        it, ix, iy = int(row[0]), int(row[1]), int(row[2])
+        t_local = it - chunk_t_start
 
-    except Exception as e:
-        logger.warning(f"Error processing datacube ({it}, {ix}, {iy}): {e}")
-        return []
+        window = transformed_chunk[t_local : t_local + Dt, ix : ix + w, iy : iy + h]
+        q = min(1.0, q_min + mean_weight * float(np.nanmean(window)))
+
+        accepted_count = int(np.sum(rng.random(n_samples) <= q))
+        if accepted_count:
+            accepted.extend([(it, ix, iy)] * accepted_count)
+
+    return accepted
 
 
 def _file_writer(output_queue: Queue, filename: str, batch_size: int = 1000) -> None:
@@ -229,12 +225,13 @@ def run(args: argparse.Namespace) -> int:
     logger.info(f"Parsed from CSV: Dt={Dt}, w={w}, h={h}")
     logger.info(f"Date range: {params['start_date']} to {params['end_date']}")
 
-    # Load dataset
+    # Load dataset (main process — just for shape info)
     logger.info(f"Opening Zarr dataset: {args.zarr_path}")
     try:
         zg = zarr.open(args.zarr_path, mode="r")
         data = zg[args.data_var]
-        logger.info(f"Dataset shape: {data.shape}")
+        size_T, size_X, size_Y = data.shape
+        logger.info(f"Dataset shape: T={size_T}, X={size_X}, Y={size_Y}")
     except Exception as e:
         logger.error(f"Error loading Zarr dataset: {e}")
         return 1
@@ -243,7 +240,12 @@ def run(args: argparse.Namespace) -> int:
     if args.output:
         output_file = args.output
     else:
-        output_file = f"sampled_datacubes_{params['start_date']}-{params['end_date']}_{Dt}x{w}x{h}_{params['step_T']}x{params['step_X']}x{params['step_Y']}_{params['max_nan']}.csv"
+        output_file = (
+            f"sampled_datacubes_{params['start_date']}-{params['end_date']}"
+            f"_{Dt}x{w}x{h}"
+            f"_{params['step_T']}x{params['step_X']}x{params['step_Y']}"
+            f"_{params['max_nan']}.csv"
+        )
 
     if os.path.exists(output_file) and not args.overwrite:
         logger.error(f"File {output_file} already exists. Use --overwrite to replace.")
@@ -278,50 +280,71 @@ def run(args: argparse.Namespace) -> int:
         json.dump(metadata, f, indent=2)
     logger.info(f"Saved run metadata to {metadata_filename}")
 
+    # Load all coordinates and sort by time
+    logger.info("Loading coordinates from CSV...")
+    all_coords = pd.read_csv(
+        args.csv_path,
+        usecols=["t", "x", "y"],
+        dtype={"t": "int32", "x": "int32", "y": "int32"},
+        engine="c",
+    )
+    all_coords.sort_values("t", inplace=True)
+    coord_values = all_coords.values  # (N, 3) array of [t, x, y]
+    logger.info(f"Loaded {len(coord_values)} coordinates, t range: [{coord_values[0, 0]}, {coord_values[-1, 0]}]")
+
+    # Define time chunks with overlap of Dt-1 (same strategy as filter_nan)
+    time_chunk_size = args.time_chunk_size if args.time_chunk_size else 3 * Dt
+    t_min = int(coord_values[0, 0])
+    t_max = int(coord_values[-1, 0]) + 1  # exclusive upper bound for coord starts
+
+    estimated_chunk_memory_gb = (time_chunk_size + Dt - 1) * size_X * size_Y * 4 / (1024**3)
+    logger.info(f"Time chunk size: {time_chunk_size} (+ {Dt - 1} overlap = {time_chunk_size + Dt - 1} loaded)")
+    logger.info(f"Estimated memory per chunk: {estimated_chunk_memory_gb:.2f} GB")
+    logger.info(f"Estimated total memory ({args.workers} workers): {estimated_chunk_memory_gb * args.workers:.2f} GB")
+
+    # Build work items: (chunk_t_start, data_t_end, coords_for_chunk)
+    t_column = coord_values[:, 0]
+    work_items = []
+
+    for chunk_t_start in range(t_min, t_max, time_chunk_size):
+        chunk_t_end = chunk_t_start + time_chunk_size
+        data_t_end = min(chunk_t_start + time_chunk_size + Dt - 1, size_T)
+
+        idx_lo = np.searchsorted(t_column, chunk_t_start, side="left")
+        idx_hi = np.searchsorted(t_column, chunk_t_end, side="left")
+        chunk_coords = coord_values[idx_lo:idx_hi]
+
+        if len(chunk_coords) == 0:
+            continue
+
+        work_items.append((
+            args.zarr_path, args.data_var, chunk_t_start, data_t_end,
+            chunk_coords, Dt, w, h, args.n_samples, args.seed,
+            args.scale, args.q_min, args.mean_weight,
+        ))
+
+    logger.info(f"Split into {len(work_items)} time chunks")
+
     # Start writer thread
     output_queue: Queue = Queue(maxsize=100)
     writer_thread = Thread(target=_file_writer, args=(output_queue, output_file, 1000))
     writer_thread.daemon = False
     writer_thread.start()
 
-    # Create partial function
-    process_partial = partial(
-        _process_datacube,
-        data=data,
-        n_samples=args.n_samples,
-        seed=args.seed,
-        scale=args.scale,
-        q_min=args.q_min,
-        mean_weight=args.mean_weight,
-        Dt=Dt,
-        w=w,
-        h=h,
-    )
-
-    # Process CSV in chunks
-    chunksize = 16000
-    pool_chunksize = max(1, chunksize // args.workers)
+    # Process time chunks in parallel
+    total_accepted = 0
 
     with Pool(args.workers) as pool:
-        pbar = tqdm(desc="Processing datacubes")
-
-        for chunk in pd.read_csv(
-            args.csv_path,
-            usecols=["t", "x", "y"],
-            dtype={"t": "int32", "x": "int32", "y": "int32"},
-            engine="c",
-            chunksize=chunksize,
+        for accepted in tqdm(
+            pool.imap(_process_time_chunk, work_items, chunksize=1),
+            total=len(work_items),
+            desc="Processing time chunks",
         ):
-            for hits in pool.imap(
-                process_partial,
-                chunk.values,
-                chunksize=pool_chunksize,
-            ):
-                if hits:
-                    output_queue.put(hits)
-                pbar.update(1)
+            if accepted:
+                output_queue.put(accepted)
+                total_accepted += len(accepted)
 
-        pbar.close()
+    logger.info(f"Accepted {total_accepted} / {len(coord_values)} datacubes")
 
     # Signal writer thread to stop
     output_queue.put(None)
