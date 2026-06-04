@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from functools import partial
 from multiprocessing import Pool
 from queue import Queue
@@ -30,8 +31,20 @@ import pyarrow.parquet as pq
 import xarray as xr
 import zarr
 from loguru import logger
-from tqdm import tqdm
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 
+from ..console import console
 from ..stats_spec import STAT_COLUMNS, StatsMetadata, build_schema
 from ..units import default_wet_threshold, detect_data_kind
 
@@ -244,6 +257,7 @@ def _parquet_writer(
 
 def run(args: argparse.Namespace) -> int:
     """Execute the stats command."""
+    start_time = time.time()
     Dt = args.time_depth
     w = args.width
     h = args.height
@@ -375,6 +389,27 @@ def run(args: argparse.Namespace) -> int:
     )
     schema = build_schema(metadata)
 
+    cfg = Table.grid(padding=(0, 2))
+    cfg.add_column(justify="right", style="bold cyan")
+    cfg.add_column()
+    cfg.add_row("Dataset", f"T={size_T:,}  X={size_X:,}  Y={size_Y:,}")
+    cfg.add_row("Time range", f"{time_array[0]:%Y-%m-%d %H:%M} → {time_array[-1]:%Y-%m-%d %H:%M}")
+    cfg.add_row("Datacube", f"{Dt} × {w} × {h}   stride {step_T} × {step_X} × {step_Y}")
+    cfg.add_row("Valid starts", f"{len(valid_starts_gap):,} gap-free")
+    cfg.add_row("Filters", f"max_nan={max_nan:,}   wet > {wet_threshold:g} {units_str}")
+    cfg.add_row("Data kind", data_kind)
+    cfg.add_row("Workers", f"{n_workers}   ~{per_chunk_gb * n_workers:.1f} GB peak")
+    cfg.add_row("Output", output_file)
+    console.print(
+        Panel(
+            cfg,
+            title="[bold]mlcast stats[/]",
+            subtitle=f"[dim]{os.path.basename(args.zarr_path)}[/]",
+            border_style="blue",
+            expand=False,
+        )
+    )
+
     output_queue: Queue = Queue(maxsize=100)
     writer_thread = Thread(
         target=_parquet_writer, args=(output_queue, output_file, schema)
@@ -382,16 +417,35 @@ def run(args: argparse.Namespace) -> int:
     writer_thread.daemon = False
     writer_thread.start()
 
-    with Pool(n_workers) as pool:
-        for hits in tqdm(
-            pool.imap(process_chunk_partial, t_pairs, chunksize=1),
-            total=len(t_starts),
-            desc="Processing time chunks",
-        ):
-            output_queue.put(hits)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    with progress:
+        task = progress.add_task("Scanning time chunks", total=len(t_starts))
+        with Pool(n_workers) as pool:
+            for hits in pool.imap(process_chunk_partial, t_pairs, chunksize=1):
+                output_queue.put(hits)
+                progress.advance(task)
 
     output_queue.put(None)
     writer_thread.join()
 
-    logger.success("stats completed successfully")
+    n_rows = pq.read_metadata(output_file).num_rows
+    console.print(
+        Panel(
+            f"[green]✓[/] Wrote [bold]{n_rows:,}[/] datacube candidates "
+            f"in [bold]{time.time() - start_time:.1f}s[/]\n"
+            f"[dim]{output_file}[/]",
+            title="[bold green]stats complete[/]",
+            border_style="green",
+            expand=False,
+        )
+    )
     return 0

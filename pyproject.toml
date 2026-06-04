@@ -39,7 +39,6 @@ dependencies = [
     "pydantic>=2",
     "requests>=2.32.5",
     "rich>=14.0.0",
-    "tqdm>=4.66.0",
     "xarray>=2025.10.0",
     "zarr>=3.1.3",
 ]
