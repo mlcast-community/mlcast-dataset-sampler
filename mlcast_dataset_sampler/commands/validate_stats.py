@@ -33,11 +33,11 @@ def _summary_grid(path: str) -> Table:
     grid = Table.grid(padding=(0, 2))
     grid.add_column(justify="right", style="bold cyan")
     grid.add_column()
-    grid.add_row("Datacube", f"{meta.time_depth} × {meta.width} × {meta.height}   "
+    grid.add_row("Datacube", f"🧊  {meta.time_depth} × {meta.width} × {meta.height}   "
                              f"stride {meta.step_t} × {meta.step_x} × {meta.step_y}")
-    grid.add_row("Range", f"{meta.start_date:%Y-%m-%d} → {meta.end_date:%Y-%m-%d}")
-    grid.add_row("Data kind", f"{meta.data_kind}   (wet > {meta.wet_threshold:g} {meta.units or '?'})")
-    grid.add_row("Rows", f"{pq.read_metadata(path).num_rows:,}")
+    grid.add_row("Range", f"🕐  {meta.start_date:%Y-%m-%d} → {meta.end_date:%Y-%m-%d}")
+    grid.add_row("Data kind", f"💧  {meta.data_kind}   (wet > {meta.wet_threshold:g} {meta.units or '?'})")
+    grid.add_row("Rows", f"🔢  {pq.read_metadata(path).num_rows:,}")
     return grid
 
 
@@ -50,7 +50,7 @@ def run(args: argparse.Namespace) -> int:
         console.print(
             Panel(
                 _summary_grid(path),
-                title="[bold green]✓ valid stats parquet[/]",
+                title="[bold green]✅ valid stats parquet[/]",
                 subtitle=f"[dim]{path}[/]",
                 border_style="green",
                 expand=False,
@@ -62,15 +62,15 @@ def run(args: argparse.Namespace) -> int:
     issues.add_column("")
     issues.add_column("message")
     for w in report.warnings:
-        issues.add_row("[yellow]warn[/]", w)
+        issues.add_row("⚠️", w)
     for e in report.errors:
-        issues.add_row("[red]error[/]", e)
+        issues.add_row("❌", e)
 
     if report.ok:
-        title = f"[bold yellow]valid — {len(report.warnings)} warning(s)[/]"
+        title = f"[bold yellow]⚠️  valid — {len(report.warnings)} warning(s)[/]"
         border = "yellow"
     else:
-        title = f"[bold red]invalid — {len(report.errors)} violation(s)[/]"
+        title = f"[bold red]❌ invalid — {len(report.errors)} violation(s)[/]"
         border = "red"
     console.print(Panel(issues, title=title, subtitle=f"[dim]{path}[/]", border_style=border, expand=False))
 

@@ -392,18 +392,18 @@ def run(args: argparse.Namespace) -> int:
     cfg = Table.grid(padding=(0, 2))
     cfg.add_column(justify="right", style="bold cyan")
     cfg.add_column()
-    cfg.add_row("Dataset", f"T={size_T:,}  X={size_X:,}  Y={size_Y:,}")
-    cfg.add_row("Time range", f"{time_array[0]:%Y-%m-%d %H:%M} → {time_array[-1]:%Y-%m-%d %H:%M}")
-    cfg.add_row("Datacube", f"{Dt} × {w} × {h}   stride {step_T} × {step_X} × {step_Y}")
-    cfg.add_row("Valid starts", f"{len(valid_starts_gap):,} gap-free")
-    cfg.add_row("Filters", f"max_nan={max_nan:,}   wet > {wet_threshold:g} {units_str}")
-    cfg.add_row("Data kind", data_kind)
-    cfg.add_row("Workers", f"{n_workers}   ~{per_chunk_gb * n_workers:.1f} GB peak")
-    cfg.add_row("Output", output_file)
+    cfg.add_row("Dataset", f"📦  T={size_T:,}  X={size_X:,}  Y={size_Y:,}")
+    cfg.add_row("Time range", f"🕐  {time_array[0]:%Y-%m-%d %H:%M} → {time_array[-1]:%Y-%m-%d %H:%M}")
+    cfg.add_row("Datacube", f"🧊  {Dt} × {w} × {h}   stride {step_T} × {step_X} × {step_Y}")
+    cfg.add_row("Valid starts", f"✅  {len(valid_starts_gap):,} gap-free")
+    cfg.add_row("Filters", f"🔍  max_nan={max_nan:,}   wet > {wet_threshold:g} {units_str}")
+    cfg.add_row("Data kind", f"💧  {data_kind}")
+    cfg.add_row("Workers", f"🧵  {n_workers}   ~{per_chunk_gb * n_workers:.1f} GB peak")
+    cfg.add_row("Output", f"💾  {output_file}")
     console.print(
         Panel(
             cfg,
-            title="[bold]mlcast stats[/]",
+            title="[bold]📊 mlcast stats[/]",
             subtitle=f"[dim]{os.path.basename(args.zarr_path)}[/]",
             border_style="blue",
             expand=False,
@@ -428,7 +428,7 @@ def run(args: argparse.Namespace) -> int:
         console=console,
     )
     with progress:
-        task = progress.add_task("Scanning time chunks", total=len(t_starts))
+        task = progress.add_task("🔍 Scanning time chunks", total=len(t_starts))
         with Pool(n_workers) as pool:
             for hits in pool.imap(process_chunk_partial, t_pairs, chunksize=1):
                 output_queue.put(hits)
@@ -440,10 +440,10 @@ def run(args: argparse.Namespace) -> int:
     n_rows = pq.read_metadata(output_file).num_rows
     console.print(
         Panel(
-            f"[green]✓[/] Wrote [bold]{n_rows:,}[/] datacube candidates "
+            f"✅ Wrote [bold]{n_rows:,}[/] datacube candidates "
             f"in [bold]{time.time() - start_time:.1f}s[/]\n"
-            f"[dim]{output_file}[/]",
-            title="[bold green]stats complete[/]",
+            f"[dim]💾 {output_file}[/]",
+            title="[bold green]🎉 stats complete[/]",
             border_style="green",
             expand=False,
         )
