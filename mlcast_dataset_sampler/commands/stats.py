@@ -1,12 +1,16 @@
-"""Light per-datacube statistics via cumsum-based sliding windows.
+"""Per-datacube statistics via cumsum-based sliding windows.
 
-This is the "pass 1" stats step in the 3-step sampling pipeline:
-filter-nan → stats-light → stats-heavy → sample. It extends the cumsum
-trick from `filter_nan` — whose original purpose was counting NaNs per
-candidate window in O(1) per window amortized — to also produce `sum`,
-`mean`, and `frac_wet` for the same candidate set, essentially for free
-on top of the I/O. Heavy stats that cannot be computed with cumsum (max,
-quantiles) are left to `stats-heavy`.
+Scans a Zarr dataset for valid datacube candidates and computes, for each
+one, `nan_count`, `sum`, `mean`, and `frac_wet` — all in O(1) per window
+amortized via a prefix-sum (cumsum) trick, essentially for free on top of
+the I/O. The survivors (those passing the `max_nan`, stride, and
+time-continuity filters) are written to a stats parquet whose contract is
+defined in `stats_spec`. Downstream, a torch Dataset reads this parquet
+and importance-samples on the `mean` column (see `sampling`); no separate
+sampling pass is needed.
+
+Heavy stats that cannot be computed with cumsum (max, quantiles) are out
+of scope here and could be added as extra columns in a future pass.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ if TYPE_CHECKING:
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add stats-light specific arguments to the parser."""
+    """Add stats specific arguments to the parser."""
     parser.add_argument("zarr_path", type=str, help="Path to the Zarr dataset.")
     parser.add_argument(
         "-o", "--output", type=str, default=None,
@@ -79,10 +83,9 @@ def _dim_cumsum_window(
 ) -> NDArray:
     """3D sliding-window sum along one axis via a prefix-sum difference.
 
-    Generic version of `filter_nan._dim_nan_count`: works for any numeric
-    dtype (int for counting, float for summing). For every window of size
-    `delta` along `dim`, returns the sum of the elements inside that
-    window. O(n) per axis regardless of `delta`.
+    Works for any numeric dtype (int for counting, float for summing). For
+    every window of size `delta` along `dim`, returns the sum of the
+    elements inside that window. O(n) per axis regardless of `delta`.
     """
     # Use int32 (not the numpy default int64) for int inputs to halve memory.
     # A window count is bounded by Dt*w*h <= 2^31, safe in int32.
@@ -240,7 +243,7 @@ def _parquet_writer(
 
 
 def run(args: argparse.Namespace) -> int:
-    """Execute the stats-light command."""
+    """Execute the stats command."""
     Dt = args.time_depth
     w = args.width
     h = args.height
@@ -317,7 +320,7 @@ def run(args: argparse.Namespace) -> int:
 
     # Peak memory per worker ~= chunk (float32) + cumsum working set + nan_mask (bool).
     # The three cumsum reductions run sequentially, so only one window array is
-    # alive at a time. ~2x filter_nan in practice.
+    # alive at a time.
     chunk_bytes = (time_chunk_size + Dt - 1) * size_X * size_Y * 4
     per_chunk_gb = 2 * chunk_bytes / (1024 ** 3)
     logger.info(f"Estimated memory per chunk: {per_chunk_gb:.2f} GB (pipelined cumsums)")
@@ -333,7 +336,7 @@ def run(args: argparse.Namespace) -> int:
         output_file = args.output
     else:
         output_file = (
-            f"stats_light_{start_str}-{end_str}_{Dt}x{w}x{h}"
+            f"stats_{start_str}-{end_str}_{Dt}x{w}x{h}"
             f"_{step_T}x{step_X}x{step_Y}_{max_nan}.parquet"
         )
     if os.path.exists(output_file) and not args.overwrite:
@@ -390,5 +393,5 @@ def run(args: argparse.Namespace) -> int:
     output_queue.put(None)
     writer_thread.join()
 
-    logger.success("stats-light completed successfully")
+    logger.success("stats completed successfully")
     return 0

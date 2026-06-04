@@ -9,7 +9,7 @@ from typing import Sequence
 from loguru import logger
 
 from . import __version__
-from .commands import filter_nan, sample, stats_light, validate_stats
+from .commands import stats, validate_stats
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,23 +38,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Available sampling commands",
     )
 
-    # filter-nan subcommand
-    filter_nan_parser = subparsers.add_parser(
-        "filter-nan",
-        help="Filter datacubes based on NaN count.",
-        description="Process a Zarr dataset and output valid datacube coordinates with NaN count below threshold.",
+    # stats subcommand
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Compute per-datacube stats (nan_count, sum, mean, frac_wet) via cumsum windows.",
+        description="Scan a Zarr dataset for valid datacube candidates and write per-window stats to parquet.",
     )
-    filter_nan.add_arguments(filter_nan_parser)
-    filter_nan_parser.set_defaults(func=filter_nan.run)
-
-    # stats-light subcommand
-    stats_light_parser = subparsers.add_parser(
-        "stats-light",
-        help="Compute cheap per-datacube stats (nan_count, sum, mean, frac_wet) via cumsum windows.",
-        description="Pass 1 of the 3-step sampling pipeline: cumsum-based per-window stats, written to parquet.",
-    )
-    stats_light.add_arguments(stats_light_parser)
-    stats_light_parser.set_defaults(func=stats_light.run)
+    stats.add_arguments(stats_parser)
+    stats_parser.set_defaults(func=stats.run)
 
     # validate-stats subcommand
     validate_stats_parser = subparsers.add_parser(
@@ -64,15 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_stats.add_arguments(validate_stats_parser)
     validate_stats_parser.set_defaults(func=validate_stats.run)
-
-    # sample subcommand
-    sample_parser = subparsers.add_parser(
-        "sample",
-        help="Importance sampling of valid datacubes.",
-        description="Perform importance sampling on filtered datacubes based on rain rate intensity.",
-    )
-    sample.add_arguments(sample_parser)
-    sample_parser.set_defaults(func=sample.run)
 
     return parser
 

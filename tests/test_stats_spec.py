@@ -54,7 +54,7 @@ def _write_parquet(path, metadata: StatsMetadata, rows: dict):
 def _good_rows(meta: StatsMetadata, n: int = 5):
     total = meta.total_px
     # All nan_count <= max_nan (the hard filter) and < total_px, so every
-    # window has valid pixels and a finite mean — what stats-light emits.
+    # window has valid pixels and a finite mean — what the stats command emits.
     nan_count = np.array([0, 1, 100, meta.max_nan // 2, meta.max_nan], dtype=np.int32)[:n]
     valid = total - nan_count
     mean = np.where(valid > 0, 0.5, np.nan).astype(np.float32)

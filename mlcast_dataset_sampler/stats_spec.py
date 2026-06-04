@@ -1,10 +1,10 @@
 """Canonical contract for a stats parquet file.
 
-A "stats parquet" is the output of `stats-light` (and, later, `stats-heavy`):
-one row per surviving datacube candidate, plus schema-level JSON metadata
-carrying the sampling parameters. Both halves of that contract live here:
+A "stats parquet" is the output of the `stats` command: one row per
+surviving datacube candidate, plus schema-level JSON metadata carrying the
+sampling parameters. Both halves of that contract live here:
 
-- ``STATS_SCHEMA`` — the column layout, which `stats_light` writes from.
+- ``STATS_SCHEMA`` — the column layout, which the `stats` command writes from.
 - ``StatsMetadata`` — a pydantic model of the sampling parameters, with
   field- and cross-field validation. Downstream commands read it via
   :func:`read_metadata` instead of re-parsing a filename.
@@ -97,8 +97,8 @@ class StatsMetadata(BaseModel):
 def build_schema(metadata: StatsMetadata) -> pa.Schema:
     """Return STATS_SCHEMA with this file's metadata attached.
 
-    This is what `stats_light` hands to its ``ParquetWriter`` so the column
-    layout and the metadata payload come from one place.
+    This is what the `stats` command hands to its ``ParquetWriter`` so the
+    column layout and the metadata payload come from one place.
     """
     payload = metadata.model_dump(mode="json")
     encoded = {STATS_METADATA_KEY: json.dumps(payload, sort_keys=True).encode()}
@@ -191,7 +191,7 @@ def validate_stats_parquet(path: str, *, check_data: bool = True) -> ValidationR
         if (nan_count > meta.max_nan).any():
             report.errors.append(
                 f"nan_count exceeds metadata max_nan ({meta.max_nan}) for some rows "
-                f"(stats-light applies this as a hard filter)"
+                f"(the stats command applies this as a hard filter)"
             )
 
     frac_wet = cols["frac_wet"]
