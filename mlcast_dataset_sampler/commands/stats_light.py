@@ -28,14 +28,11 @@ import zarr
 from loguru import logger
 from tqdm import tqdm
 
-from ..metadata import encode_stats_metadata
+from ..stats_spec import STAT_COLUMNS, StatsMetadata, build_schema
 from ..units import default_wet_threshold, detect_data_kind
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
-
-
-STAT_COLUMNS = ("t", "x", "y", "nan_count", "sum", "mean", "frac_wet")
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -211,28 +208,17 @@ def _process_chunk(
 def _parquet_writer(
     output_queue: Queue,
     filename: str,
-    schema_metadata: dict[bytes, bytes],
+    schema: pa.Schema,
 ) -> None:
     """Drain the queue and stream rows to a Parquet file.
 
     Each queue item is the dict returned by `_process_chunk`. We buffer
     into Arrow RecordBatches and append to a single ParquetWriter so the
-    on-disk file stays a single self-contained parquet. `schema_metadata`
-    carries the mlcast sampling parameters (Dt, w, h, stride, etc.) so
-    downstream commands don't need to parse the filename.
+    on-disk file stays a single self-contained parquet. `schema` is the
+    canonical STATS_SCHEMA with the mlcast sampling parameters attached as
+    metadata (see `stats_spec.build_schema`), so downstream commands don't
+    need to parse the filename.
     """
-    schema = pa.schema(
-        [
-            ("t", pa.int32()),
-            ("x", pa.int32()),
-            ("y", pa.int32()),
-            ("nan_count", pa.int32()),
-            ("sum", pa.float32()),
-            ("mean", pa.float32()),
-            ("frac_wet", pa.float32()),
-        ],
-        metadata=schema_metadata,
-    )
     writer = pq.ParquetWriter(filename, schema, compression="zstd")
     total_rows = 0
     try:
@@ -366,30 +352,29 @@ def run(args: argparse.Namespace) -> int:
         valid_starts_gap=valid_starts_gap,
     )
 
-    schema_metadata = encode_stats_metadata(
-        {
-            "zarr_path": args.zarr_path,
-            "data_var": args.data_var,
-            "time_var": args.time_var,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
-            "time_step_minutes": args.time_step_minutes,
-            "time_depth": Dt,
-            "width": w,
-            "height": h,
-            "step_t": step_T,
-            "step_x": step_X,
-            "step_y": step_Y,
-            "max_nan": max_nan,
-            "wet_threshold": wet_threshold,
-            "data_kind": data_kind,
-            "units": var_attrs.get("units"),
-        }
+    metadata = StatsMetadata(
+        zarr_path=args.zarr_path,
+        data_var=args.data_var,
+        time_var=args.time_var,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        time_step_minutes=args.time_step_minutes,
+        time_depth=Dt,
+        width=w,
+        height=h,
+        step_t=step_T,
+        step_x=step_X,
+        step_y=step_Y,
+        max_nan=max_nan,
+        wet_threshold=wet_threshold,
+        data_kind=data_kind,
+        units=var_attrs.get("units"),
     )
+    schema = build_schema(metadata)
 
     output_queue: Queue = Queue(maxsize=100)
     writer_thread = Thread(
-        target=_parquet_writer, args=(output_queue, output_file, schema_metadata)
+        target=_parquet_writer, args=(output_queue, output_file, schema)
     )
     writer_thread.daemon = False
     writer_thread.start()

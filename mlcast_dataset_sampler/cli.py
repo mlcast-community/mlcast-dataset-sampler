@@ -9,7 +9,7 @@ from typing import Sequence
 from loguru import logger
 
 from . import __version__
-from .commands import filter_nan, sample, stats_light
+from .commands import filter_nan, sample, stats_light, validate_stats
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +55,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stats_light.add_arguments(stats_light_parser)
     stats_light_parser.set_defaults(func=stats_light.run)
+
+    # validate-stats subcommand
+    validate_stats_parser = subparsers.add_parser(
+        "validate-stats",
+        help="Validate a stats parquet file against the canonical contract.",
+        description="Check column schema, metadata payload, and per-row value invariants of a stats parquet.",
+    )
+    validate_stats.add_arguments(validate_stats_parser)
+    validate_stats_parser.set_defaults(func=validate_stats.run)
 
     # sample subcommand
     sample_parser = subparsers.add_parser(
