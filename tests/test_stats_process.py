@@ -1,17 +1,16 @@
-"""Regression tests for `_process_chunk`'s stride-first refactor.
+"""Correctness tests for `_process_chunk`.
 
-Two independent oracles guard the rewrite:
+`_process_chunk` is checked against two independent reference
+implementations:
 
-1. ``_process_chunk_old`` — a verbatim copy of the pre-refactor
-   (all-positions ``np.where`` + ``np.isin``) implementation. The new code
-   must match it **exactly** on the integer columns (t, x, y, nan_count,
-   frac_wet) and to ``allclose`` on sum/mean (the time-axis now uses
-   bottleneck's running ``move_sum``, whose float accumulation order differs
-   from a cumsum by ~1 ULP).
-2. ``_brute_force`` — a naive per-window reference that sums each candidate
-   window directly (no cumsum trick). The new code must match it in value
-   (exact for integer columns, ``allclose`` for the float sum/mean, whose
-   addition order legitimately differs).
+1. ``_reference_all_positions`` — windows every position, then filters by
+   max_nan / stride / continuity (no striding between the cumsum axes).
+2. ``_brute_force`` — sums each candidate window directly, with no cumsum
+   trick at all.
+
+Integer columns (t, x, y, nan_count, frac_wet) must match exactly; sum and
+mean are compared with ``allclose``, since float summation order differs
+between the implementations.
 """
 
 from __future__ import annotations
@@ -28,9 +27,9 @@ from mlcast_dataset_sampler.commands.stats import (
 STAT_KEYS = ("t", "x", "y", "nan_count", "sum", "mean", "frac_wet")
 
 
-# --- Oracle 1: verbatim pre-refactor implementation --------------------------
+# --- Reference 1: window every position, then filter -------------------------
 
-def _process_chunk_old(
+def _reference_all_positions(
     time_range, t_start_idx, data, max_nan, wet_threshold, deltas, steps, valid_starts_gap
 ):
     start_t, end_t = time_range
@@ -73,7 +72,7 @@ def _process_chunk_old(
     }
 
 
-# --- Oracle 2: naive per-window brute force ----------------------------------
+# --- Reference 2: naive per-window brute force -------------------------------
 
 def _brute_force(chunk, deltas, steps, max_nan, wet_threshold, start_t, t_start_idx, valid_start_mask):
     Dt, w, h = deltas
@@ -138,7 +137,7 @@ CASES = [
 
 
 @pytest.mark.parametrize("seed,deltas,steps,max_nan,wet_thr,start_t,t_start_idx", CASES)
-def test_byte_identical_to_old(seed, deltas, steps, max_nan, wet_thr, start_t, t_start_idx):
+def test_matches_reference(seed, deltas, steps, max_nan, wet_thr, start_t, t_start_idx):
     T_total, X, Y = 60, 44, 40
     data = _make_data(seed, T_total, X, Y)
     size_T = T_total - t_start_idx
@@ -157,20 +156,20 @@ def test_byte_identical_to_old(seed, deltas, steps, max_nan, wet_thr, start_t, t
     # _process_chunk zero-fills its chunk in place. For a zarr array `data[slice]`
     # returns a fresh array so that's harmless; for a plain numpy `data` the slice
     # is a *view*, so pass each impl its own copy to avoid cross-call mutation.
-    new = _process_chunk(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_start_mask)
-    old = _process_chunk_old(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_starts_gap)
+    out = _process_chunk(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_start_mask)
+    ref = _reference_all_positions(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_starts_gap)
 
-    # Exact on the integer columns; allclose on the float sum/mean (the
-    # time axis uses bottleneck move_sum, which differs from a cumsum by ~ULP).
+    # Exact on the integer columns; allclose on the float sum/mean (float
+    # summation order differs between the two implementations).
     for k in ("t", "x", "y", "nan_count", "frac_wet"):
-        assert np.array_equal(new[k], old[k]), f"column {k} differs from old impl"
-    assert np.allclose(new["sum"], old["sum"], rtol=1e-5, atol=1e-3), "sum diverges from old impl"
-    assert np.allclose(new["mean"], old["mean"], rtol=1e-5, atol=1e-4, equal_nan=True), "mean diverges"
+        assert np.array_equal(out[k], ref[k]), f"column {k} differs from reference"
+    assert np.allclose(out["sum"], ref["sum"], rtol=1e-5, atol=1e-3), "sum diverges from reference"
+    assert np.allclose(out["mean"], ref["mean"], rtol=1e-5, atol=1e-4, equal_nan=True), "mean diverges"
     # dtypes must match the parquet schema expectations
     for k in ("t", "x", "y", "nan_count"):
-        assert new[k].dtype == np.int32, f"{k} dtype {new[k].dtype}"
+        assert out[k].dtype == np.int32, f"{k} dtype {out[k].dtype}"
     for k in ("sum", "mean", "frac_wet"):
-        assert new[k].dtype == np.float32, f"{k} dtype {new[k].dtype}"
+        assert out[k].dtype == np.float32, f"{k} dtype {out[k].dtype}"
 
 
 @pytest.mark.parametrize("seed,deltas,steps,max_nan,wet_thr,start_t,t_start_idx", CASES)
@@ -208,7 +207,7 @@ def test_window_sum_order_invariant_for_integers():
 
 def test_window_sum_includes_last_window():
     # Output length must be dim_len - delta + 1, and the final window start
-    # (the one the old off-by-one dropped) must hold the correct sum.
+    # (at dim_len - delta) must hold the correct sum.
     rng = np.random.default_rng(1)
     arr = rng.integers(0, 5, size=(11, 13, 9)).astype(np.int16)
     deltas, dl = (4, 5, 3), arr.shape

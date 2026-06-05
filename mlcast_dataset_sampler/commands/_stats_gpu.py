@@ -1,11 +1,10 @@
 """GPU (PyTorch) backend for the per-chunk stats windowing.
 
-Mirrors the CPU `stats._process_chunk` (stride-first + progressive striding)
-on CUDA tensors: the chunk is moved to the GPU once, the three windowed
-stats are reduced onto the strided candidate grid, and only the ~survivors
-are copied back. Measured ~60× faster per chunk than the CPU path on a real
-IT-DPC chunk; `nan_count`/`frac_wet` match the CPU exactly, `sum`/`mean` to
-~1 ULP (float accumulation order).
+Mirrors the CPU `stats._process_chunk` on CUDA tensors: the chunk is moved
+to the GPU once, the three windowed stats are reduced onto the strided
+candidate grid, and only the survivors are copied back. `nan_count` and
+`frac_wet` match the CPU exactly; `sum`/`mean` agree to a few float32 ULP
+(the GPU sums in a different order).
 
 This module is imported only when ``--device cuda`` is selected, so torch
 stays an optional dependency (the ``gpu`` extra).

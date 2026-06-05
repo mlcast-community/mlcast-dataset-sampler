@@ -1,10 +1,10 @@
 """Per-datacube statistics via cumsum-based sliding windows.
 
 Scans a Zarr dataset for valid datacube candidates and computes, for each
-one, `nan_count`, `sum`, `mean`, and `frac_wet` — all in O(1) per window
-amortized via a prefix-sum (cumsum) trick, essentially for free on top of
-the I/O. The survivors (those passing the `max_nan`, stride, and
-time-continuity filters) are written to a stats parquet whose contract is
+one, `nan_count`, `sum`, `mean`, and `frac_wet`, each in O(1) per window
+amortized via a prefix-sum (cumsum) trick. The survivors (those passing
+the `max_nan`, stride, and time-continuity filters) are written to a stats
+parquet whose contract is
 defined in `stats_spec`. Downstream, a torch Dataset reads this parquet
 and importance-samples on the `mean` column (see `sampling`); no separate
 sampling pass is needed.
@@ -156,23 +156,21 @@ def _strided_window(
 ) -> NDArray:
     """Windowed sum reduced to the strided, gap-free candidate grid.
 
-    Windows the time axis, keeps only the strided + continuous t-slices,
-    then windows x and y — each cumsum running on the already-strided
-    (smaller) array. Striding *between* the axes (rather than windowing the
-    full cube and slicing afterwards) shrinks the x cumsum by `step_t` and
-    the y cumsum by `step_t · step_x`. The values at the kept positions are
-    identical to the full-then-slice version, because windowing each axis is
-    independent of which positions are kept on the others.
+    Windows the time axis, keeps only the strided, gap-free t-slices, then
+    windows x and y on the already-strided (smaller) arrays. Selecting the
+    candidate grid *between* the axes shrinks the x cumsum by ``step_t`` and
+    the y cumsum by ``step_t * step_x`` while leaving the kept values
+    unchanged: windowing one axis is independent of which positions are kept
+    on the others.
 
-    The full-array time axis uses bottleneck's C ``move_sum`` (~2.8× faster
-    than a numpy cumsum on this large, non-contiguous axis); the strided
+    The full-array time axis uses bottleneck's ``move_sum`` (faster than a
+    numpy cumsum on this large, non-contiguous axis); the small strided
     spatial axes stay on numpy. ``move_sum`` needs float input and emits NaN
-    for the first ``Dt-1`` incomplete windows, dropped with ``[Dt-1:]``.
-    Counts (bool/int inputs) are exact integers, kept as int32 (exact to
-    2^31); value sums stay float32 and may differ from a cumsum by ~1 ULP.
+    for the first ``Dt-1`` incomplete windows, dropped with ``[Dt-1:]``;
+    integer counts are cast back to int32 (exact to 2^31).
 
     `keep_t` is the boolean continuity mask over the strided t-grid
-    (``arange(off_t, dim_lengths[0] - deltas[0] + 1, step_t)``); its length
+    ``arange(off_t, dim_lengths[0] - deltas[0] + 1, step_t)``; its length
     must match that grid.
     """
     Dt, w, h = deltas
@@ -197,21 +195,16 @@ def _process_chunk(
     steps: tuple[int, int, int],
     valid_start_mask: NDArray[np.bool_],
 ) -> dict[str, NDArray]:
-    """Compute cumsum-based stats for the strided candidate windows in a chunk.
+    """Compute the windowed stats for one time chunk's candidate datacubes.
 
-    Only ~1/(step_t·step_x·step_y) of window positions are ever kept, so
-    rather than windowing the full cube and slicing afterwards, each stat is
-    computed with `_strided_window`: the candidate grid is selected *between*
-    the cumsum axes, so the x and y cumsums run on the already-strided
-    (smaller) arrays, and the full-array time axis uses bottleneck's C
-    `move_sum`. `nan_count` and `frac_wet` are exact (integer) matches to the
-    full-cube version; `sum`/`mean` may differ by ~1 ULP (float accumulation
-    order).
+    Returns the survivors — windows passing the `max_nan`, stride, and
+    time-continuity filters — with their `nan_count`, `sum`, `mean`, and
+    `frac_wet`, as a dict of numpy arrays matching `STATS_SCHEMA`.
 
-    The three reductions (nan_count, sum, wet_count) are produced
-    **sequentially** and freed in between, keeping peak memory near one
-    windowed array. `valid_start_mask` is a boolean LUT over the filtered
-    time axis (True at gap-free window starts).
+    The three reductions (nan_count, sum, wet_count) are each computed with
+    `_strided_window` and freed before the next, keeping peak memory near a
+    single windowed array. `valid_start_mask` is a boolean lookup over the
+    filtered time axis (True at gap-free window starts).
     """
     start_t, end_t = time_range
     chunk = data[start_t + t_start_idx : end_t + t_start_idx, :, :].astype(np.float32, copy=False)
@@ -444,8 +437,8 @@ def run(args: argparse.Namespace) -> int:
     window_sum = np.convolve(gaps, np.ones(Dt - 1, dtype=int), mode="valid")
     valid_starts_gap = np.where(window_sum == 0)[0]
     logger.info(f"Found {len(valid_starts_gap)} valid time starts without gaps")
-    # Boolean LUT over the filtered time axis: O(1) continuity lookup per
-    # candidate in the workers (replaces an np.isin over millions of rows).
+    # Boolean lookup over the filtered time axis for an O(1) continuity test
+    # per candidate window start.
     valid_start_mask = np.zeros(size_T, dtype=bool)
     valid_start_mask[valid_starts_gap] = True
 
@@ -474,17 +467,6 @@ def run(args: argparse.Namespace) -> int:
         logger.error(f"File {output_file} already exists. Use --overwrite to replace.")
         return 1
     logger.info(f"Output file: {output_file}")
-
-    process_chunk_partial = partial(
-        _process_chunk,
-        t_start_idx=t_start_idx,
-        data=data,
-        max_nan=max_nan,
-        wet_threshold=wet_threshold,
-        deltas=(Dt, w, h),
-        steps=(step_T, step_X, step_Y),
-        valid_start_mask=valid_start_mask,
-    )
 
     metadata = StatsMetadata(
         zarr_path=args.zarr_path,
@@ -572,6 +554,16 @@ def run(args: argparse.Namespace) -> int:
                 output_queue.put(hits)
                 progress.advance(task)
     else:
+        process_chunk_partial = partial(
+            _process_chunk,
+            t_start_idx=t_start_idx,
+            data=data,
+            max_nan=max_nan,
+            wet_threshold=wet_threshold,
+            deltas=(Dt, w, h),
+            steps=(step_T, step_X, step_Y),
+            valid_start_mask=valid_start_mask,
+        )
         with progress:
             task = progress.add_task("🔍 Scanning time chunks", total=len(t_starts))
             with Pool(n_workers) as pool:
