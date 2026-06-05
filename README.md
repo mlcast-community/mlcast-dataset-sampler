@@ -40,8 +40,22 @@ uv run mlcast.sample_dataset stats /path/to/radar.zarr \
 This outputs a Parquet file with columns `t, x, y, nan_count, sum, mean, frac_wet`,
 one row per surviving `(t, x, y)` candidate. The sampling parameters (datacube shape,
 stride, date range, wet threshold, ...) are embedded in the parquet schema metadata,
-so downstream code never has to parse the filename. Validate a file against the
-contract with:
+so downstream code never has to parse the filename.
+
+**CPU or GPU, automatically.** The windowing runs on the CPU (multiprocessing +
+[bottleneck](https://github.com/pydata/bottleneck)) by default. If PyTorch and a CUDA
+GPU are available it runs on the GPU instead (~60× faster per chunk). Control it with
+`--device {auto,cpu,cuda}` (`auto` is the default). For the GPU path install the extra:
+
+```bash
+uv sync --extra gpu        # adds PyTorch
+uv run mlcast.sample_dataset stats ... --device cuda   # or just leave --device auto
+```
+
+On the GPU path `--workers` is the number of chunk-reader threads that prefetch and
+decompress while the GPU computes.
+
+Validate a file against the contract with:
 
 ```bash
 uv run mlcast.sample_dataset validate-stats stats_2021-01-01-2024-12-31_24x256x256_3x16x16_10000.parquet

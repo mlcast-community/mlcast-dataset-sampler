@@ -86,7 +86,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--time-step-minutes", type=int, default=5,
         help="Expected time step between consecutive frames in minutes.",
     )
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers.")
+    parser.add_argument(
+        "--device", choices=["auto", "cpu", "cuda"], default="auto",
+        help="Compute backend. 'auto' (default) uses CUDA if PyTorch + a GPU are "
+             "available, else the CPU. 'cuda' requires the 'gpu' extra.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="CPU: number of worker processes. GPU: number of chunk-reader threads.",
+    )
     parser.add_argument("--data-var", type=str, default="RR", help="Name of the zarr data variable.")
     parser.add_argument("--time-var", type=str, default="time", help="Name of the zarr time variable.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists.")
@@ -301,6 +309,58 @@ def _parquet_writer(
     logger.info(f"Wrote {total_rows} rows to {filename}")
 
 
+def _resolve_device(requested: str) -> tuple[str, str]:
+    """Resolve the compute backend to ('cpu'|'cuda', human label).
+
+    'auto' picks CUDA when PyTorch + a GPU are importable/available, else CPU.
+    'cuda' raises ValueError if PyTorch or a GPU is missing. 'cpu' is forced.
+    """
+    if requested == "cpu":
+        return "cpu", "cpu (bottleneck)"
+    try:
+        import torch
+    except ImportError:
+        if requested == "cuda":
+            raise ValueError(
+                "--device cuda requested but PyTorch is not installed "
+                "(install the 'gpu' extra, e.g. `uv sync --extra gpu`)."
+            )
+        return "cpu", "cpu (bottleneck)"
+    if torch.cuda.is_available():
+        return "cuda", f"cuda ({torch.cuda.get_device_name(0)})"
+    if requested == "cuda":
+        raise ValueError("--device cuda requested but no CUDA GPU is available.")
+    return "cpu", "cpu (bottleneck)"
+
+
+def _prefetched(read_fn, items, lookahead: int, n_workers: int):
+    """Yield ``read_fn(item)`` results in submission order, keeping up to
+    `lookahead` reads in flight across `n_workers` threads.
+
+    Used by the GPU path to overlap chunk reads/decompression (which release
+    the GIL) with GPU compute, so the device stays fed. Memory is bounded by
+    `lookahead` chunks.
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        it = iter(items)
+        inflight: deque = deque()
+        for _ in range(lookahead):
+            try:
+                inflight.append(ex.submit(read_fn, next(it)))
+            except StopIteration:
+                break
+        while inflight:
+            fut = inflight.popleft()
+            try:
+                inflight.append(ex.submit(read_fn, next(it)))
+            except StopIteration:
+                pass
+            yield fut.result()
+
+
 def run(args: argparse.Namespace) -> int:
     """Execute the stats command."""
     start_time = time.time()
@@ -313,6 +373,13 @@ def run(args: argparse.Namespace) -> int:
     max_nan = args.max_nan
     n_workers = args.workers
     time_chunk_size = 3 * Dt
+
+    try:
+        device, device_label = _resolve_device(args.device)
+    except ValueError as e:
+        logger.error(str(e))
+        return 1
+    logger.info(f"Compute backend: {device_label}")
 
     logger.info(f"Opening Zarr dataset: {args.zarr_path}")
     try:
@@ -448,7 +515,11 @@ def run(args: argparse.Namespace) -> int:
     cfg.add_row("Valid starts", f"✅  {len(valid_starts_gap):,} gap-free")
     cfg.add_row("Filters", f"🔍  max_nan={max_nan:,}   wet > {wet_threshold:g} {units_str}")
     cfg.add_row("Data kind", f"💧  {data_kind}")
-    cfg.add_row("Workers", f"🧵  {n_workers}   ~{per_chunk_gb * n_workers:.1f} GB peak")
+    cfg.add_row("Device", f"⚡  {device_label}")
+    if device == "cuda":
+        cfg.add_row("Readers", f"🧵  {n_workers} threads")
+    else:
+        cfg.add_row("Workers", f"🧵  {n_workers}   ~{per_chunk_gb * n_workers:.1f} GB peak")
     cfg.add_row("Output", f"💾  {output_file}")
     console.print(
         Panel(
@@ -477,12 +548,36 @@ def run(args: argparse.Namespace) -> int:
         TimeRemainingColumn(),
         console=console,
     )
-    with progress:
-        task = progress.add_task("🔍 Scanning time chunks", total=len(t_starts))
-        with Pool(n_workers) as pool:
-            for hits in pool.imap(process_chunk_partial, t_pairs, chunksize=1):
+    if device == "cuda":
+        import torch
+
+        from . import _stats_gpu
+
+        dev = torch.device("cuda")
+
+        def _read_chunk(tp):
+            s0, e0 = int(tp[0]), int(tp[1])
+            arr = np.asarray(data[s0 + t_start_idx : e0 + t_start_idx, :, :], dtype=np.float32)
+            return (s0, e0), arr
+
+        with progress:
+            task = progress.add_task("🔍 Scanning time chunks (GPU)", total=len(t_starts))
+            for time_range, chunk_np in _prefetched(
+                _read_chunk, t_pairs, lookahead=n_workers + 2, n_workers=max(1, n_workers)
+            ):
+                hits = _stats_gpu.process_chunk(
+                    time_range, t_start_idx, chunk_np, max_nan, wet_threshold,
+                    (Dt, w, h), (step_T, step_X, step_Y), valid_start_mask, dev,
+                )
                 output_queue.put(hits)
                 progress.advance(task)
+    else:
+        with progress:
+            task = progress.add_task("🔍 Scanning time chunks", total=len(t_starts))
+            with Pool(n_workers) as pool:
+                for hits in pool.imap(process_chunk_partial, t_pairs, chunksize=1):
+                    output_queue.put(hits)
+                    progress.advance(task)
 
     output_queue.put(None)
     writer_thread.join()
