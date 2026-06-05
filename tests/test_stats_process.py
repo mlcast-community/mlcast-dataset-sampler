@@ -4,7 +4,10 @@ Two independent oracles guard the rewrite:
 
 1. ``_process_chunk_old`` — a verbatim copy of the pre-refactor
    (all-positions ``np.where`` + ``np.isin``) implementation. The new code
-   must be **byte-identical** to it on every column.
+   must match it **exactly** on the integer columns (t, x, y, nan_count,
+   frac_wet) and to ``allclose`` on sum/mean (the time-axis now uses
+   bottleneck's running ``move_sum``, whose float accumulation order differs
+   from a cumsum by ~1 ULP).
 2. ``_brute_force`` — a naive per-window reference that sums each candidate
    window directly (no cumsum trick). The new code must match it in value
    (exact for integer columns, ``allclose`` for the float sum/mean, whose
@@ -157,9 +160,12 @@ def test_byte_identical_to_old(seed, deltas, steps, max_nan, wet_thr, start_t, t
     new = _process_chunk(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_start_mask)
     old = _process_chunk_old(time_range, t_start_idx, data.copy(), max_nan, wet_thr, deltas, steps, valid_starts_gap)
 
-    for k in ("t", "x", "y", "nan_count", "sum", "frac_wet"):
+    # Exact on the integer columns; allclose on the float sum/mean (the
+    # time axis uses bottleneck move_sum, which differs from a cumsum by ~ULP).
+    for k in ("t", "x", "y", "nan_count", "frac_wet"):
         assert np.array_equal(new[k], old[k]), f"column {k} differs from old impl"
-    assert np.array_equal(new["mean"], old["mean"], equal_nan=True), "mean differs from old impl"
+    assert np.allclose(new["sum"], old["sum"], rtol=1e-5, atol=1e-3), "sum diverges from old impl"
+    assert np.allclose(new["mean"], old["mean"], rtol=1e-5, atol=1e-4, equal_nan=True), "mean diverges"
     # dtypes must match the parquet schema expectations
     for k in ("t", "x", "y", "nan_count"):
         assert new[k].dtype == np.int32, f"{k} dtype {new[k].dtype}"
