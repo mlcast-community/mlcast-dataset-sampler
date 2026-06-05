@@ -99,16 +99,22 @@ def _dim_cumsum_window(
     Works for any numeric dtype (int for counting, float for summing). For
     every window of size `delta` along `dim`, returns the sum of the
     elements inside that window. O(n) per axis regardless of `delta`.
+
+    The output length along `dim` is ``dim_len - delta + 1`` (one entry per
+    valid window start, including the final one at ``dim_len - delta``).
     """
     # Use int32 (not the numpy default int64) for int inputs to halve memory.
     # A window count is bounded by Dt*w*h <= 2^31, safe in int32.
     cumsum = np.cumsum(arr, axis=dim, dtype=arr.dtype if arr.dtype.kind == "f" else np.int32)
 
+    # Prepend a zero plane so window [k, k+delta) == padded[k+delta] - padded[k].
     pad_width = [(1, 0) if i == dim else (0, 0) for i in range(arr.ndim)]
     padded = np.pad(cumsum, pad_width=pad_width, mode="constant", constant_values=0)
 
-    slices_start = [slice(dim_len - delta) if i == dim else slice(None) for i in range(arr.ndim)]
-    slices_end = [slice(delta, dim_len) if i == dim else slice(None) for i in range(arr.ndim)]
+    # Window starts k = 0 .. dim_len-delta, so padded[k] spans [0, dim_len-delta]
+    # and padded[k+delta] spans [delta, dim_len] (note the inclusive +1 ends).
+    slices_start = [slice(dim_len - delta + 1) if i == dim else slice(None) for i in range(arr.ndim)]
+    slices_end = [slice(delta, dim_len + 1) if i == dim else slice(None) for i in range(arr.ndim)]
 
     return padded[tuple(slices_end)] - padded[tuple(slices_start)]
 
@@ -182,9 +188,8 @@ def _process_chunk(
     # (no int16 intermediate).
     nan_count_win = _datacube_window_sum(nan_mask, deltas, dim_lengths, order=(2, 1, 0))
 
-    # Strided, gap-free window-start indices. The windowed array's axis-0
-    # length (dim_lengths[0] - Dt, NOT +1: _dim_cumsum_window drops the last
-    # window) is the source of truth, so this stays in lockstep with it.
+    # Strided, gap-free window-start indices, derived from the windowed
+    # array's actual axis-0 length so they stay in lockstep with it.
     t_rel_strided = np.arange(off_t, nan_count_win.shape[0], step_t, dtype=np.int32)
     keep_t = valid_start_mask[t_rel_strided + start_t]  # time-continuity filter
     t_rel_kept = t_rel_strided[keep_t]

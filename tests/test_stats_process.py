@@ -77,18 +77,16 @@ def _brute_force(chunk, deltas, steps, max_nan, wet_threshold, start_t, t_start_
     step_t, step_x, step_y = steps
     T, X, Y = chunk.shape
     total_px = Dt * w * h
-    # NOTE: upper bound is dim-delta (exclusive), not dim-delta+1: the
-    # cumsum-window in _dim_cumsum_window drops the final window start on
-    # each axis (a pre-existing off-by-one). The brute force mirrors that
-    # so it validates the algorithm's actual contract.
+    # Every valid window start: it in [0, T-Dt], ix in [0, X-w], iy in [0, Y-h]
+    # (inclusive upper bound — the final window on each axis is included).
     rows = []
-    for it in range(T - Dt):
+    for it in range(T - Dt + 1):
         if not valid_start_mask[it + start_t]:
             continue
         if (it + start_t + t_start_idx) % step_t != 0:
             continue
-        for ix in range(0, X - w, step_x):
-            for iy in range(0, Y - h, step_y):
+        for ix in range(0, X - w + 1, step_x):
+            for iy in range(0, Y - h + 1, step_y):
                 win = chunk[it:it + Dt, ix:ix + w, iy:iy + h]
                 filled = np.where(np.isnan(win), np.float32(0.0), win)
                 nan_c = int(np.isnan(win).sum())
@@ -200,6 +198,20 @@ def test_window_sum_order_invariant_for_integers():
     a = _datacube_window_sum(mask, deltas, dl, order=(0, 1, 2))
     b = _datacube_window_sum(mask, deltas, dl, order=(2, 1, 0))
     assert np.array_equal(a, b)
+
+
+def test_window_sum_includes_last_window():
+    # Output length must be dim_len - delta + 1, and the final window start
+    # (the one the old off-by-one dropped) must hold the correct sum.
+    rng = np.random.default_rng(1)
+    arr = rng.integers(0, 5, size=(11, 13, 9)).astype(np.int16)
+    deltas, dl = (4, 5, 3), arr.shape
+    out = _datacube_window_sum(arr, deltas, dl)
+    assert out.shape == (dl[0] - deltas[0] + 1, dl[1] - deltas[1] + 1, dl[2] - deltas[2] + 1)
+    # last window on every axis, compared to a direct sum
+    lt, lx, ly = dl[0] - deltas[0], dl[1] - deltas[1], dl[2] - deltas[2]
+    expected = int(arr[lt:lt + deltas[0], lx:lx + deltas[1], ly:ly + deltas[2]].sum())
+    assert int(out[lt, lx, ly]) == expected
 
 
 def test_empty_when_all_windows_fail():
