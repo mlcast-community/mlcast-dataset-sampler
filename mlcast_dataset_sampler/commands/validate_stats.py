@@ -36,6 +36,7 @@ def _summary_grid(path: str) -> Table:
     grid.add_row("Datacube", f"🧊  {meta.time_depth} × {meta.width} × {meta.height}   "
                              f"stride {meta.step_t} × {meta.step_x} × {meta.step_y}")
     grid.add_row("Range", f"🕐  {meta.start_date:%Y-%m-%d} → {meta.end_date:%Y-%m-%d}")
+    grid.add_row("Time step", f"⏱️  {meta.time_step_minutes} min")
     grid.add_row("Data kind", f"💧  {meta.data_kind}   (wet > {meta.wet_threshold:g} {meta.units or '?'})")
     grid.add_row("Rows", f"🔢  {pq.read_metadata(path).num_rows:,}")
     return grid

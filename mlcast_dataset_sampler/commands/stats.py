@@ -282,7 +282,22 @@ def _parquet_writer(
     metadata (see `stats_spec.build_schema`), so downstream commands don't
     need to parse the filename.
     """
-    writer = pq.ParquetWriter(filename, schema, compression="zstd")
+    # Column encodings tuned to the data: `t` is written in ascending order so
+    # it delta-encodes to almost nothing; x/y/nan_count are low-cardinality
+    # (dictionary); the floats compress better split into byte planes.
+    writer = pq.ParquetWriter(
+        filename,
+        schema,
+        compression="zstd",
+        compression_level=9,
+        use_dictionary=["x", "y", "nan_count"],
+        column_encoding={
+            "t": "DELTA_BINARY_PACKED",
+            "sum": "BYTE_STREAM_SPLIT",
+            "mean": "BYTE_STREAM_SPLIT",
+            "frac_wet": "BYTE_STREAM_SPLIT",
+        },
+    )
     total_rows = 0
     try:
         while True:
@@ -493,6 +508,7 @@ def run(args: argparse.Namespace) -> int:
     cfg.add_column()
     cfg.add_row("Dataset", f"📦  T={size_T:,}  X={size_X:,}  Y={size_Y:,}")
     cfg.add_row("Time range", f"🕐  {time_array[0]:%Y-%m-%d %H:%M} → {time_array[-1]:%Y-%m-%d %H:%M}")
+    cfg.add_row("Time step", f"⏱️  {args.time_step_minutes} min")
     cfg.add_row("Datacube", f"🧊  {Dt} × {w} × {h}   stride {step_T} × {step_X} × {step_Y}")
     cfg.add_row("Valid starts", f"✅  {len(valid_starts_gap):,} gap-free")
     cfg.add_row("Filters", f"🔍  max_nan={max_nan:,}   wet > {wet_threshold:g} {units_str}")
