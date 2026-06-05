@@ -123,19 +123,51 @@ def _datacube_window_sum(
     arr: NDArray, deltas: tuple[int, int, int], dim_lengths: tuple[int, int, int],
     order: tuple[int, int, int] = (0, 1, 2),
 ) -> NDArray:
-    """3-axis cumsum-window sum over a (T, X, Y) array.
+    """3-axis cumsum-window sum over a (T, X, Y) array (all positions).
 
     `order` is the sequence in which the axes are windowed. Windowing one
     axis only shrinks that axis, so for an associative reduction the result
-    is independent of `order`. Integer (count) stats therefore use the
-    cache-friendlier (2, 1, 0) — the strided time axis runs last, on the
-    already spatially-reduced array (~16% faster). The float `sum` pass
-    keeps (0, 1, 2) so its rounding is bit-for-bit identical to before.
+    is independent of `order`. The production path uses `_strided_window`
+    instead (it evaluates only the kept positions); this full-cube variant
+    is kept for tests and reference.
     """
     s = arr
     for ax in order:
         s = _dim_cumsum_window(s, dim=ax, delta=deltas[ax], dim_len=dim_lengths[ax])
     return s
+
+
+def _strided_window(
+    arr: NDArray,
+    deltas: tuple[int, int, int],
+    dim_lengths: tuple[int, int, int],
+    off_t: int,
+    steps: tuple[int, int, int],
+    keep_t: NDArray[np.bool_],
+) -> NDArray:
+    """Windowed sum reduced to the strided, gap-free candidate grid.
+
+    Windows the time axis, keeps only the strided + continuous t-slices,
+    then windows x and y — each cumsum running on the already-strided
+    (smaller) array. Striding *between* the axes (rather than windowing the
+    full cube and slicing afterwards) shrinks the x cumsum by `step_t` and
+    the y cumsum by `step_t · step_x`, ~1.5× faster end-to-end. The values
+    at the kept positions are identical to the full-then-slice version,
+    because windowing each axis is independent of which positions are kept
+    on the others.
+
+    `keep_t` is the boolean continuity mask over the strided t-grid
+    (``arange(off_t, dim_lengths[0] - deltas[0] + 1, step_t)``); its length
+    must match that grid.
+    """
+    Dt, w, h = deltas
+    step_t, step_x, step_y = steps
+    s = _dim_cumsum_window(arr, dim=0, delta=Dt, dim_len=dim_lengths[0])
+    s = s[off_t::step_t][keep_t]
+    s = _dim_cumsum_window(s, dim=1, delta=w, dim_len=dim_lengths[1])
+    s = s[:, 0::step_x]
+    s = _dim_cumsum_window(s, dim=2, delta=h, dim_len=dim_lengths[2])
+    return s[:, :, 0::step_y]
 
 
 def _process_chunk(
@@ -150,19 +182,17 @@ def _process_chunk(
 ) -> dict[str, NDArray]:
     """Compute cumsum-based stats for the strided candidate windows in a chunk.
 
-    Stride-first: only ~1/(step_t·step_x·step_y) of window positions are
-    ever kept, so instead of computing `nan_count` everywhere and then
-    discarding 99% with ``np.where`` + ``np.isin`` (which collected
-    millions of rows on real data — see the perf review), we slice each
-    windowed array onto the strided, gap-free candidate grid *before*
-    evaluating it. Output is byte-identical to the all-positions version,
-    but the filtering step is ~700× cheaper and avoids the large index
-    allocation.
+    Only ~1/(step_t·step_x·step_y) of window positions are ever kept, so
+    rather than windowing the full cube and slicing afterwards, each stat is
+    computed with `_strided_window`: the candidate grid is selected *between*
+    the cumsum axes, so the x and y cumsums run on the already-strided
+    (smaller) arrays (~1.5× faster end-to-end). Output is byte-identical to
+    the full-cube version.
 
-    The three cumsum-window reductions (nan_count, sum, wet_count) are
-    still produced **sequentially** and freed in between, keeping peak
-    memory near one windowed array. `valid_start_mask` is a boolean LUT
-    over the filtered time axis (True at gap-free window starts).
+    The three reductions (nan_count, sum, wet_count) are produced
+    **sequentially** and freed in between, keeping peak memory near one
+    windowed array. `valid_start_mask` is a boolean LUT over the filtered
+    time axis (True at gap-free window starts).
     """
     start_t, end_t = time_range
     chunk = data[start_t + t_start_idx : end_t + t_start_idx, :, :].astype(np.float32, copy=False)
@@ -171,31 +201,19 @@ def _process_chunk(
     step_t, step_x, step_y = steps
     total_px = Dt * w * h
 
-    # The strided candidate sub-grid is known a priori from absolute-index
-    # alignment; only the nan_count test below depends on the data.
-    #   x: idx_x % step_x == 0  -> 0::step_x   (chunk x is already absolute)
-    #   y: idx_y % step_y == 0  -> 0::step_y
-    #   t: (idx_t_rel + start_t + t_start_idx) % step_t == 0 -> off_t::step_t
+    # Strided, gap-free time-window starts, absolute-index aligned. The time
+    # window count is dim_lengths[0] - Dt + 1 (see _dim_cumsum_window); the
+    # x/y stride offsets are 0 because chunk x/y are already absolute.
     off_t = (-(start_t + t_start_idx)) % step_t
-    strided = (slice(off_t, None, step_t), slice(None, None, step_x), slice(None, None, step_y))
+    t_rel_strided = np.arange(off_t, dim_lengths[0] - Dt + 1, step_t, dtype=np.int32)
+    keep_t = valid_start_mask[t_rel_strided + start_t]  # time-continuity filter
+    t_rel_kept = t_rel_strided[keep_t]
 
     # Build the NaN mask once; (a) drives nan_count, (b) zero-fills the sum pass.
     nan_mask = np.isnan(chunk)  # bool, 1 byte/element
 
-    # --- Pass A: nan_count, evaluated only on the strided candidate grid ---------
-    # Integer counts are order-independent, so window the cache-unfriendly
-    # time axis last (order=(2, 1, 0)). Cumsum consumes the bool mask directly
-    # (no int16 intermediate).
-    nan_count_win = _datacube_window_sum(nan_mask, deltas, dim_lengths, order=(2, 1, 0))
-
-    # Strided, gap-free window-start indices, derived from the windowed
-    # array's actual axis-0 length so they stay in lockstep with it.
-    t_rel_strided = np.arange(off_t, nan_count_win.shape[0], step_t, dtype=np.int32)
-    keep_t = valid_start_mask[t_rel_strided + start_t]  # time-continuity filter
-    t_rel_kept = t_rel_strided[keep_t]
-
-    ncw_s = nan_count_win[strided][keep_t]
-    del nan_count_win
+    # --- Pass A: nan_count on the strided candidate grid -------------------------
+    ncw_s = _strided_window(nan_mask, deltas, dim_lengths, off_t, steps, keep_t)
     surv_t, surv_x, surv_y = np.where(ncw_s <= max_nan)
     nan_count = ncw_s[surv_t, surv_x, surv_y].astype(np.int32)
     del ncw_s
@@ -206,21 +224,20 @@ def _process_chunk(
     idx_y = (surv_y * step_y).astype(np.int32)
     idx_t_abs = (idx_t_rel + (start_t + t_start_idx)).astype(np.int32)
 
-    # --- Pass B: sum window (axis order (0,1,2) preserves float rounding) --------
+    # --- Pass B: sum -------------------------------------------------------------
     chunk[nan_mask] = 0.0
-    sum_win = _datacube_window_sum(chunk, deltas, dim_lengths)
-    sum_vals = sum_win[strided][keep_t][surv_t, surv_x, surv_y]
-    del sum_win
+    sum_vals = _strided_window(chunk, deltas, dim_lengths, off_t, steps, keep_t)[
+        surv_t, surv_x, surv_y
+    ]
 
-    # --- Pass C: wet_count window ------------------------------------------------
+    # --- Pass C: wet_count -------------------------------------------------------
     # `chunk` is now zero where it was NaN, so `> wet_threshold` is equivalent
-    # to (value > threshold AND not NaN). Integer count -> order=(2, 1, 0).
+    # to (value > threshold AND not NaN).
     wet_mask = chunk > wet_threshold
     del chunk, nan_mask
-    wet_count_win = _datacube_window_sum(wet_mask, deltas, dim_lengths, order=(2, 1, 0))
-    del wet_mask
-    wet_count = wet_count_win[strided][keep_t][surv_t, surv_x, surv_y]
-    del wet_count_win
+    wet_count = _strided_window(wet_mask, deltas, dim_lengths, off_t, steps, keep_t)[
+        surv_t, surv_x, surv_y
+    ]
 
     # Derived stats.
     valid_count = total_px - nan_count
