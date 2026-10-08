@@ -1,5 +1,11 @@
 # mlcast-dataset-sampler
 
+> [!WARNING]
+> **This repository is archived and no longer maintained.**
+> The dataset sampler has been folded into the [`mlcast`](https://github.com/mlcast-community/mlcast) package
+> ([mlcast-community/mlcast#17](https://github.com/mlcast-community/mlcast/pull/17)). Use `mlcast build-sampling-index`
+> and the selectors in `mlcast.data.source_data.sampling` instead.
+
 Utility to sample MLCast source datasets and generate training-ready data indices.
 
 ## Usage
